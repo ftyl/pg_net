@@ -143,14 +143,14 @@ def test_can_delete_rows_while_processing_queue(sess, autocommit_sess):
 
     sess.execute(text(
         """
-        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,20);
+        select net.http_get('http://localhost:8080/pathological?status=200&delay=1') from generate_series(1,10);
     """
     ))
 
     sess.commit()
 
     # leave time for some processing
-    time.sleep(0.05)
+    time.sleep(0.1)
 
     (count,) = sess.execute(text(
         """
@@ -240,7 +240,7 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
 
     sess.execute(text(
         """
-        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,50);
+        select net.http_get('http://localhost:8080/pathological?status=200&delay=1') from generate_series(1,5);
     """
     ))
 
@@ -255,7 +255,7 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
     """
     ))
 
-    time.sleep(0.1)
+    time.sleep(1)
 
     sess.execute(text(
         """
@@ -264,7 +264,7 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
     """
     ))
 
-    time.sleep(0.1)
+    time.sleep(1)
 
     (status_code,count) = sess.execute(text(
     """
@@ -272,8 +272,8 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
     """
     )).fetchone()
 
-    # at most 20 requests should have finished by now because of the low batch_size
-    assert count <= 20
+    # at most 2 requests should have finished by now because of the low batch_size and delay
+    assert count <= 2
     assert count > 0 # at least 1 request should be finished
     assert status_code == 200
 
