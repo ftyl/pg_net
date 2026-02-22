@@ -143,14 +143,14 @@ def test_can_delete_rows_while_processing_queue(sess, autocommit_sess):
 
     sess.execute(text(
         """
-        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,10);
+        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,20);
     """
     ))
 
     sess.commit()
 
     # leave time for some processing
-    time.sleep(0.1)
+    time.sleep(0.05)
 
     (count,) = sess.execute(text(
         """
@@ -240,7 +240,7 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
 
     sess.execute(text(
         """
-        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,5);
+        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,50);
     """
     ))
 
@@ -272,13 +272,13 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
     """
     )).fetchone()
 
-    # at most 2 requests should have finished by now because of the low batch_size
-    assert count <= 2
+    # at most 20 requests should have finished by now because of the low batch_size
+    assert count <= 20
     assert count > 0 # at least 1 request should be finished
     assert status_code == 200
 
-    # if we sleep for 4 seconds the whole 5 requests should be finished
-    time.sleep(4)
+    # if we sleep for 2 seconds the whole 50 requests should be finished
+    time.sleep(2)
 
     (status_code,count) = sess.execute(text(
     """
@@ -287,7 +287,7 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
     )).fetchone()
 
     assert status_code == 200
-    assert count == 5
+    assert count == 50
 
     autocommit_sess.execute(text("alter system reset pg_net.batch_size"))
     autocommit_sess.execute(text("select net.worker_restart()"))

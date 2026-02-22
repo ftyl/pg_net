@@ -433,7 +433,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
           }
 
           // these two counts should always be in sync
-          elog(DEBUG1, "Filled curl handles: %d, curl running_handles: %d", active_count,
+          elog(DEBUG1, "Active curl handles: %d, curl running_handles: %d", active_count,
                running_handles);
         }
 
