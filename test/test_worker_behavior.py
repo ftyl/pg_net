@@ -143,7 +143,7 @@ def test_can_delete_rows_while_processing_queue(sess, autocommit_sess):
 
     sess.execute(text(
         """
-        select net.http_get('http://localhost:8080/pathological?status=200&delay=1') from generate_series(1,10);
+        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,10);
     """
     ))
 
@@ -240,7 +240,7 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
 
     sess.execute(text(
         """
-        select net.http_get('http://localhost:8080/pathological?status=200&delay=1') from generate_series(1,5);
+        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,5);
     """
     ))
 

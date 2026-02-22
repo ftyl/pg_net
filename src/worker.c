@@ -435,6 +435,9 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
           // these two counts should always be in sync
           elog(DEBUG1, "Active curl handles: %d, curl running_handles: %d", active_count,
                running_handles);
+
+          // slow down queue processing to avoid using too much CPU
+          wait_while_processing_interrupts(WORKER_WAIT_ONE_SECOND, &worker_should_restart);
         }
 
   
