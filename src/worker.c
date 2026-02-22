@@ -403,10 +403,17 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
           // we refill free slots only if the worker is not supposed to restart, we will continue
           // after restart instead
           if (!worker_should_restart && free_slots > 0) {
+            elog(DEBUG1, "REFILL - %d free slots available for filling", free_slots);
+
+            // delete expired responses
+            expired_responses = delete_expired_responses(guc_ttl, guc_batch_size);
+
+            elog(DEBUG1, "REFILL - Deleted " UINT64_FORMAT " expired rows", expired_responses);
+
             // read up to free_slots number of requests
             uint64 new_requests = consume_request_queue(free_slots);
             if (new_requests > 0) {
-              elog(DEBUG1, "Refilling " UINT64_FORMAT " new requests into %d free slots",
+              elog(DEBUG1, "REFILL - Refilling " UINT64_FORMAT " new requests into %d free slots",
                     new_requests, free_slots);
 
               uint64 filled = 0;
@@ -426,7 +433,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
           }
 
           // these two counts should always be in sync
-          elog(DEBUG1, "Active curl handles: %d, curl running_handles: %d", active_count,
+          elog(DEBUG1, "Filled curl handles: %d, curl running_handles: %d", active_count,
                running_handles);
         }
 
