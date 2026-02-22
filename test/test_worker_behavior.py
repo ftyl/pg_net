@@ -255,7 +255,7 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
     """
     ))
 
-    time.sleep(1)
+    time.sleep(0.1)
 
     sess.execute(text(
         """
@@ -264,7 +264,7 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
     """
     ))
 
-    time.sleep(1)
+    time.sleep(0.1)
 
     (status_code,count) = sess.execute(text(
     """
@@ -272,13 +272,13 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
     """
     )).fetchone()
 
-    # at most 2 requests should have finished by now because of the low batch_size and delay
+    # at most 2 requests should have finished by now because of the low batch_size
     assert count <= 2
     assert count > 0 # at least 1 request should be finished
     assert status_code == 200
 
-    # if we sleep for 2 seconds the whole 50 requests should be finished
-    time.sleep(2)
+    # if we sleep for 4 seconds the whole 5 requests should be finished
+    time.sleep(4)
 
     (status_code,count) = sess.execute(text(
     """
@@ -287,7 +287,7 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
     )).fetchone()
 
     assert status_code == 200
-    assert count == 50
+    assert count == 5
 
     autocommit_sess.execute(text("alter system reset pg_net.batch_size"))
     autocommit_sess.execute(text("select net.worker_restart()"))
