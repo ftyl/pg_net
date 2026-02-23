@@ -386,48 +386,87 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
           // but we do not want to risk reading a request from the queue and then not having a slot for it
           // doing it in two loops gives us a safer number of free slots
 
-          // find the slot and mark it free
-          for (int i = 0; i < guc_batch_size; i++) {
-            for (int j = 0; j < num_finished; j++) {
-              if (slot_in_use[i] && &handles[i] == finished_handles[j]) {
-                curl_easy_cleanup(handles[i].ez_handle);
-                pfree_handle(&handles[i]);
-                memset(&handles[i], 0, sizeof(CurlHandle));
-                slot_in_use[i] = false;
-                active_count--;
-                break;
+          if (num_finished > 0) {
+            // Commit the current transaction so that:
+            // - inserted responses become visible to other sessions
+            // - DELETE'd queue rows release their row locks
+            // This prevents the worker from holding long-lived row locks that
+            // block other sessions trying to access the queue.
+            SPI_finish();
+            unlock_extension(ext_table_oids);
+            PopActiveSnapshot();
+            CommitTransactionCommand();
+
+            // find the slot and mark it free (no transaction needed for cleanup)
+            for (int i = 0; i < guc_batch_size; i++) {
+              for (int j = 0; j < num_finished; j++) {
+                if (slot_in_use[i] && &handles[i] == finished_handles[j]) {
+                  curl_easy_cleanup(handles[i].ez_handle);
+                  pfree_handle(&handles[i]);
+                  memset(&handles[i], 0, sizeof(CurlHandle));
+                  slot_in_use[i] = false;
+                  active_count--;
+                  break;
+                }
               }
             }
-          }
 
-          int free_slots = guc_batch_size - active_count;
-          // we refill free slots only if the worker is not supposed to restart, we will continue
-          // after restart instead
-          if (!worker_should_restart && free_slots > 0) {
-            elog(DEBUG1, "REFILL - %d free slots available for filling", free_slots);
+            // Start a new transaction for refill and/or next curl iteration
+            SetCurrentStatementStartTimestamp();
+            StartTransactionCommand();
+            PushActiveSnapshot(GetTransactionSnapshot());
 
-            // delete expired responses
-            expired_responses = delete_expired_responses(guc_ttl, guc_batch_size);
-
-            elog(DEBUG1, "REFILL - Deleted " UINT64_FORMAT " expired rows", expired_responses);
-
-            // read up to free_slots number of requests
-            new_requests = consume_request_queue(free_slots);
-            if (new_requests > 0) {
-              elog(DEBUG1, "REFILL - Refilling " UINT64_FORMAT " new requests into %d free slots",
-                    new_requests, free_slots);
-
-              uint64 n = 0;
-              for (int i = 0; i < guc_batch_size && n < new_requests; i++) {
-                if (!slot_in_use[i]) {
-                  init_curl_handle(
-                      &handles[i],
-                      get_request_queue_row(SPI_tuptable->vals[n], SPI_tuptable->tupdesc));
+            if (!is_extension_locked(ext_table_oids)) {
+              elog(DEBUG1, "pg_net extension not loaded during refill");
+              PopActiveSnapshot();
+              AbortCurrentTransaction();
+              // extension is gone, clean up remaining active handles and exit
+              for (int i = 0; i < guc_batch_size; i++) {
+                if (slot_in_use[i]) {
                   EREPORT_MULTI(
-                      curl_multi_add_handle(worker_state->curl_mhandle, handles[i].ez_handle));
-                  slot_in_use[i] = true;
-                  active_count++;
-                  n++;
+                      curl_multi_remove_handle(worker_state->curl_mhandle, handles[i].ez_handle));
+                  curl_easy_cleanup(handles[i].ez_handle);
+                  pfree_handle(&handles[i]);
+                }
+              }
+              pfree(finished_handles);
+              pfree(slot_in_use);
+              pfree(handles);
+              // skip the outer cleanup since we already cleaned up
+              goto batch_done;
+            }
+
+            SPI_connect();
+
+            int free_slots = guc_batch_size - active_count;
+            // we refill free slots only if the worker is not supposed to restart, we will continue
+            // after restart instead
+            if (!worker_should_restart && free_slots > 0) {
+              elog(DEBUG1, "REFILL - %d free slots available for filling", free_slots);
+
+              // delete expired responses
+              expired_responses = delete_expired_responses(guc_ttl, guc_batch_size);
+
+              elog(DEBUG1, "REFILL - Deleted " UINT64_FORMAT " expired rows", expired_responses);
+
+              // read up to free_slots number of requests
+              new_requests = consume_request_queue(free_slots);
+              if (new_requests > 0) {
+                elog(DEBUG1, "REFILL - Refilling " UINT64_FORMAT " new requests into %d free slots",
+                      new_requests, free_slots);
+
+                uint64 n = 0;
+                for (int i = 0; i < guc_batch_size && n < new_requests; i++) {
+                  if (!slot_in_use[i]) {
+                    init_curl_handle(
+                        &handles[i],
+                        get_request_queue_row(SPI_tuptable->vals[n], SPI_tuptable->tupdesc));
+                    EREPORT_MULTI(
+                        curl_multi_add_handle(worker_state->curl_mhandle, handles[i].ez_handle));
+                    slot_in_use[i] = true;
+                    active_count++;
+                    n++;
+                  }
                 }
               }
             }
@@ -462,6 +501,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
       PopActiveSnapshot();
       CommitTransactionCommand();
 
+    batch_done:
       // slow down queue processing to avoid using too much CPU
       wait_while_processing_interrupts(WORKER_WAIT_ONE_SECOND, &worker_should_restart);
 
