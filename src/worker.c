@@ -319,10 +319,11 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
         }
 
         // start curl event loop
-        int   running_handles = 0;
-        int   maxevents       = guc_batch_size + 1; // 1 extra for the timer, need batch_size since we might fill more slots
-        event events[maxevents];
-        CurlHandle *finished_handles[guc_batch_size];
+        int    running_handles = 0;
+        uint64 new_requests    = 0;
+        int    maxevents       = guc_batch_size + 1; // 1 extra for the timer, need batch_size since we might fill more slots
+        event  events[maxevents];
+        CurlHandle **finished_handles = palloc0(mul_size(sizeof(CurlHandle *), guc_batch_size));
 
         while (active_count > 0) {
           int nfds =
@@ -411,33 +412,30 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
             elog(DEBUG1, "REFILL - Deleted " UINT64_FORMAT " expired rows", expired_responses);
 
             // read up to free_slots number of requests
-            uint64 new_requests = consume_request_queue(free_slots);
+            new_requests = consume_request_queue(free_slots);
             if (new_requests > 0) {
               elog(DEBUG1, "REFILL - Refilling " UINT64_FORMAT " new requests into %d free slots",
                     new_requests, free_slots);
 
-              uint64 filled = 0;
-              for (int i = 0; i < guc_batch_size && filled < new_requests; i++) {
+              uint64 n = 0;
+              for (int i = 0; i < guc_batch_size && n < new_requests; i++) {
                 if (!slot_in_use[i]) {
                   init_curl_handle(
                       &handles[i],
-                      get_request_queue_row(SPI_tuptable->vals[filled], SPI_tuptable->tupdesc));
+                      get_request_queue_row(SPI_tuptable->vals[n], SPI_tuptable->tupdesc));
                   EREPORT_MULTI(
                       curl_multi_add_handle(worker_state->curl_mhandle, handles[i].ez_handle));
                   slot_in_use[i] = true;
                   active_count++;
-                  filled++;
+                  n++;
                 }
               }
             }
           }
 
           // these two counts should always be in sync
-          elog(DEBUG1, "Active curl handles: %d, curl running_handles: %d", active_count,
-               running_handles);
-
-          // slow down queue processing to avoid using too much CPU
-          wait_while_processing_interrupts(WORKER_WAIT_ONE_SECOND, &worker_should_restart);
+          elog(DEBUG1, "Active curl handles: %d -- curl running_handles: %d, new_requests: " UINT64_FORMAT, active_count,
+               running_handles, new_requests);
         }
 
   
@@ -452,6 +450,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
           }
         }
 
+        pfree(finished_handles);
         pfree(slot_in_use);
         pfree(handles);
       }

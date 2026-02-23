@@ -143,13 +143,14 @@ def test_can_delete_rows_while_processing_queue(sess, autocommit_sess):
 
     sess.execute(text(
         """
-        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,10);
+        select net.http_get('http://localhost:8080/pathological?status=200&delay=1') from generate_series(1,10);
     """
     ))
 
     sess.commit()
 
-    # leave time for some processing
+    # leave time for the worker to pull its batch (but requests are slow enough
+    # that most remain in the queue)
     time.sleep(0.1)
 
     (count,) = sess.execute(text(
@@ -177,12 +178,12 @@ def test_truncate_wait_while_processing_queue(sess, autocommit_sess):
 
     sess.execute(text(
         """
-        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,10);
+        select net.http_get('http://localhost:8080/pathological?status=200&delay=1') from generate_series(1,10);
     """
     ))
     sess.commit()
 
-    # truncate succeeds fast, despite the worker still processing the queue 1 by 1
+    # truncate succeeds fast, despite the worker still processing slow requests
     sess.execute(text(
         """
         truncate net.http_request_queue;
@@ -240,7 +241,7 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
 
     sess.execute(text(
         """
-        select net.http_get('http://localhost:8080/pathological?status=200') from generate_series(1,5);
+        select net.http_get('http://localhost:8080/pathological?status=200&delay=0.5') from generate_series(1,5);
     """
     ))
 
@@ -266,19 +267,17 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
 
     time.sleep(0.1)
 
-    (status_code,count) = sess.execute(text(
+    # with slow requests (0.5s each) and batch_size=1, not all may be finished yet
+    (count,) = sess.execute(text(
     """
-        select status_code, count(*) from net._http_response group by status_code;
+        select count(*) from net._http_response;
     """
     )).fetchone()
 
-    # at most 2 requests should have finished by now because of the low batch_size
-    assert count <= 2
-    assert count > 0 # at least 1 request should be finished
-    assert status_code == 200
+    assert count < 5
 
-    # if we sleep for 4 seconds the whole 5 requests should be finished
-    time.sleep(4)
+    # give enough time for all 5 slow requests to finish (5 * 0.5s = 2.5s + overhead)
+    time.sleep(6)
 
     (status_code,count) = sess.execute(text(
     """
