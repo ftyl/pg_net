@@ -393,7 +393,6 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
             // This prevents the worker from holding long-lived row locks that
             // block other sessions trying to access the queue.
             SPI_finish();
-            unlock_extension(ext_table_oids);
             PopActiveSnapshot();
             CommitTransactionCommand();
 
@@ -415,26 +414,6 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
             SetCurrentStatementStartTimestamp();
             StartTransactionCommand();
             PushActiveSnapshot(GetTransactionSnapshot());
-
-            if (!is_extension_locked(ext_table_oids)) {
-              elog(DEBUG1, "pg_net extension not loaded during refill");
-              PopActiveSnapshot();
-              AbortCurrentTransaction();
-              // extension is gone, clean up remaining active handles and exit
-              for (int i = 0; i < guc_batch_size; i++) {
-                if (slot_in_use[i]) {
-                  EREPORT_MULTI(
-                      curl_multi_remove_handle(worker_state->curl_mhandle, handles[i].ez_handle));
-                  curl_easy_cleanup(handles[i].ez_handle);
-                  pfree_handle(&handles[i]);
-                }
-              }
-              pfree(finished_handles);
-              pfree(slot_in_use);
-              pfree(handles);
-              // skip the outer cleanup since we already cleaned up
-              goto batch_done;
-            }
 
             SPI_connect();
 
@@ -477,7 +456,14 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
                running_handles, new_requests);
         }
 
+        // we are done processing, close our transaction quickly now, we cleanup curl things after
+        SPI_finish();
+
+        unlock_extension(ext_table_oids);
   
+        PopActiveSnapshot();
+        CommitTransactionCommand();
+          
         // cleanup whatever is remaining
         for (int i = 0; i < guc_batch_size; i++) {
           if (slot_in_use[i]) {
@@ -492,16 +478,17 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
         pfree(finished_handles);
         pfree(slot_in_use);
         pfree(handles);
+      } else {
+        // close the transaction here if no requests were consumed in the first place
+        SPI_finish();
+
+        unlock_extension(ext_table_oids);
+  
+        PopActiveSnapshot();
+        CommitTransactionCommand();
       }
 
-      SPI_finish();
 
-      unlock_extension(ext_table_oids);
-
-      PopActiveSnapshot();
-      CommitTransactionCommand();
-
-    batch_done:
       // slow down queue processing to avoid using too much CPU
       wait_while_processing_interrupts(WORKER_WAIT_ONE_SECOND, &worker_should_restart);
 
