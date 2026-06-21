@@ -212,8 +212,8 @@ static bool is_extension_locked(Oid ext_table_oids[static total_extension_tables
     return false;
   }
 
-  Oid queue_oid = get_relname_relid("http_request_queue", net_oid);
-  Oid resp_oid  = get_relname_relid("_http_response", net_oid);
+  Oid queue_oid    = get_relname_relid("http_request_queue", net_oid);
+  Oid resp_oid     = get_relname_relid("_http_response", net_oid);
   Oid inflight_oid = get_relname_relid("http_request_inflight", net_oid);
 
   if (!OidIsValid(queue_oid) || !OidIsValid(resp_oid) || !OidIsValid(inflight_oid)) {
@@ -263,14 +263,15 @@ static void commit_worker_tx(Oid ext_table_oids[static total_extension_tables]) 
 
 static uint64 fill_handle_slots(CurlHandle *handles, bool *slot_in_use, int *active_count,
                                 uint64 claimed_rows) {
-  uint64 slot_fill_idx = 0;
+  MemoryContext old_ctx       = MemoryContextSwitchTo(TopMemoryContext);
+  uint64        slot_fill_idx = 0;
   for (int i = 0; i < guc_batch_size && slot_fill_idx < claimed_rows; i++) {
     if (slot_in_use[i]) {
       continue;
     }
 
-    init_curl_handle(&handles[i],
-                     get_request_queue_row(SPI_tuptable->vals[slot_fill_idx], SPI_tuptable->tupdesc));
+    init_curl_handle(&handles[i], get_request_queue_row(SPI_tuptable->vals[slot_fill_idx],
+                                                        SPI_tuptable->tupdesc));
     EREPORT_MULTI(curl_multi_add_handle(worker_state->curl_mhandle, handles[i].ez_handle));
     slot_in_use[i] = true;
     (*active_count)++;
@@ -281,6 +282,7 @@ static uint64 fill_handle_slots(CurlHandle *handles, bool *slot_in_use, int *act
     ereport(ERROR, errmsg("Failed to fill all claimed queue rows into worker slots"));
   }
 
+  MemoryContextSwitchTo(old_ctx);
   return slot_fill_idx;
 }
 
@@ -366,8 +368,8 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
     int    running_handles     = 0;
     bool   extension_available = true;
 
-    CurlHandle  *handles = palloc0(mul_size(sizeof(CurlHandle), guc_batch_size));
-    bool        *slot_in_use = palloc0(mul_size(sizeof(bool), guc_batch_size));
+    CurlHandle  *handles          = palloc0(mul_size(sizeof(CurlHandle), guc_batch_size));
+    bool        *slot_in_use      = palloc0(mul_size(sizeof(bool), guc_batch_size));
     CurlHandle **finished_handles = palloc0(mul_size(sizeof(CurlHandle *), guc_batch_size));
     CURLcode    *finished_results = palloc0(mul_size(sizeof(CURLcode), guc_batch_size));
 
@@ -392,7 +394,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
 
         int free_slots = guc_batch_size - active_count;
 
-        expired_responses = delete_expired_responses(guc_ttl, guc_batch_size);
+        expired_responses  = delete_expired_responses(guc_ttl, guc_batch_size);
         reclaimed_requests = reclaim_expired_inflight_requests(guc_batch_size);
 
         requests_claimed = 0;

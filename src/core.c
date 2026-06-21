@@ -188,8 +188,8 @@ uint64 reclaim_expired_inflight_requests(const int batch_size) {
     if (reclaim_inflight_plan == NULL) ereport(ERROR, errmsg("SPI_saveplan failed"));
   }
 
-  int ret_code = SPI_execute_plan(reclaim_inflight_plan, (Datum[]){Int32GetDatum(batch_size)}, NULL,
-                                  false, 0);
+  int ret_code =
+      SPI_execute_plan(reclaim_inflight_plan, (Datum[]){Int32GetDatum(batch_size)}, NULL, false, 0);
 
   if (ret_code != SPI_OK_INSERT) {
     ereport(ERROR,
@@ -252,8 +252,8 @@ uint64 claim_request_queue(const int batch_size) {
       SPI_execute_plan(claim_queue_plan, (Datum[]){Int32GetDatum(batch_size)}, NULL, false, 0);
 
   if (ret_code != SPI_OK_SELECT)
-    ereport(ERROR, errmsg("Error claiming http request queue rows: %s",
-                          SPI_result_code_string(ret_code)));
+    ereport(ERROR,
+            errmsg("Error claiming http request queue rows: %s", SPI_result_code_string(ret_code)));
 
   return SPI_processed;
 }
@@ -396,11 +396,11 @@ void mark_request_complete(int64 request_id) {
     if (del_inflight_plan == NULL) ereport(ERROR, errmsg("SPI_saveplan failed"));
   }
 
-  int ret_code = SPI_execute_plan(del_inflight_plan, (Datum[]){Int64GetDatum(request_id)}, NULL,
-                                  false, 0);
+  int ret_code =
+      SPI_execute_plan(del_inflight_plan, (Datum[]){Int64GetDatum(request_id)}, NULL, false, 0);
   if (ret_code != SPI_OK_DELETE) {
-    ereport(ERROR, errmsg("Error when completing inflight request: %s",
-                          SPI_result_code_string(ret_code)));
+    ereport(ERROR,
+            errmsg("Error when completing inflight request: %s", SPI_result_code_string(ret_code)));
   }
 }
 
