@@ -1,3 +1,5 @@
+# Contributing
+
 pg_net is OSS. PR and issues are welcome.
 
 
@@ -11,10 +13,8 @@ pg_net is OSS. PR and issues are welcome.
 For testing locally, execute:
 
 ```bash
-$ cachix use nxpg
-
-# might take a while in downloading all the dependencies
-$ nix-shell
+# This will download all the dependencies from the cache (when prompted for trusting the nxpg cache answer yes)
+$ nix develop
 
 # test on latest pg
 $ xpg test
@@ -94,26 +94,3 @@ $ net-loadtest 1000 200
 |          2.001 |         4 |      20.418 |        437.566 |
 |          3.002 |         3 |      20.418 |        437.566 |
 ```
-
-## Documentation
-
-All public API must be documented. Building documentation requires python 3.6+
-
-
-### Install Dependencies
-
-Install mkdocs, themes, and extensions.
-
-```shell
-pip install -r docs/requirements_docs.txt
-```
-
-### Serving
-
-To serve the documentation locally run
-
-```shell
-mkdocs serve
-```
-
-and visit the docs at [http://127.0.0.1:8000/pg_net/](http://127.0.0.1:8000/pg_net/)

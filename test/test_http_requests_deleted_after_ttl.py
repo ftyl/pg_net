@@ -3,6 +3,15 @@ import time
 import pytest
 from sqlalchemy import text
 
+def wait_until(predicate, timeout=5.0, interval=0.1):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
 def test_http_responses_deleted_after_ttl(sess, autocommit_sess):
     """Check that http responses will be deleted when they reach their ttl, not immediately but when the worker wakes again"""
 
@@ -41,18 +50,15 @@ def test_http_responses_deleted_after_ttl(sess, autocommit_sess):
 
     sess.commit() # commit so worker  wakes
 
-    time.sleep(0.1) # wait for deletion
-
     # Ensure the response is now empty
-    (count,) = sess.execute(
-        text(
-            """
-        select count(*) from net._http_response where id = :request_id;
-    """
-        ),
-        {"request_id": request_id},
-    ).fetchone()
-    assert count == 0
+    assert wait_until(
+        lambda: sess.execute(
+            text("select count(*) from net._http_response where id = :request_id;"),
+            {"request_id": request_id},
+        ).scalar()
+        == 0,
+        timeout=3.0,
+    ), "response row was not deleted after ttl wake"
 
     autocommit_sess.execute(text("alter system reset pg_net.ttl"))
     autocommit_sess.execute(text("select net.worker_restart()"))
@@ -102,28 +108,17 @@ def test_http_responses_will_complete_deletion(sess, autocommit_sess):
     sess.execute(text("select net.wake()"))
     sess.commit() # commit so worker  wakes
 
-    time.sleep(0.1)
+    # Depending on timing, the first wake may initially see no expired rows,
+    # but deletion should still make progress shortly after.
+    assert wait_until(
+        lambda: sess.execute(text("select count(*) from net._http_response")).scalar() < 4,
+        timeout=3.0,
+    ), "expired response deletion did not make progress"
 
-    (count,) = sess.execute(
-        text(
-            """
-        select count(*) from net._http_response
-    """
-        )
-    ).fetchone()
-    assert count == 2
-
-    # wait for another batch
-    time.sleep(1.1)
-
-    (count,) = sess.execute(
-        text(
-            """
-        select count(*) from net._http_response
-    """
-        )
-    ).fetchone()
-    assert count == 0
+    assert wait_until(
+        lambda: sess.execute(text("select count(*) from net._http_response")).scalar() == 0,
+        timeout=5.0,
+    ), "expired responses were not fully deleted"
 
     autocommit_sess.execute(text("alter system reset pg_net.ttl"))
     autocommit_sess.execute(text("alter system reset pg_net.batch_size"))
@@ -168,17 +163,10 @@ def test_http_responses_will_delete_despite_restart(sess, autocommit_sess):
     autocommit_sess.execute(text("select net.worker_restart()"))
     autocommit_sess.execute(text("select net.wait_until_running()"))
 
-    # wait for ttl
-    time.sleep(1.1)
-
-    (count,) = sess.execute(
-        text(
-            """
-        select count(*) from net._http_response
-    """
-        )
-    ).fetchone()
-    assert count == 0
+    assert wait_until(
+        lambda: sess.execute(text("select count(*) from net._http_response")).scalar() == 0,
+        timeout=5.0,
+    ), "responses were not deleted after restart"
 
     # reset
     autocommit_sess.execute(text("alter system reset pg_net.ttl"))

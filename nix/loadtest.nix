@@ -79,11 +79,38 @@ writeShellScriptBin "net-loadtest" ''
 
   net-with-nginx xpg --options "-c log_min_messages=WARNING $batch_size_opt" \
     psql -c "call wait_for_many_gets($reqs)" -c "\pset format csv" -c "\o $query_csv" -c "select * from run" > /dev/null &
+  load_pid=$!
 
-  # wait for process to start so we can capture it with psrecord
-  sleep 2
+  bgworker_pid_file=build-17/bgworker.pid
+  bgworker_pid=""
+  # The worker can start and finish quickly with fast refill logic. Poll briefly
+  # for a live pid instead of relying on a fixed sleep.
+  for _ in $(seq 1 50); do
+    if [ -f "$bgworker_pid_file" ]; then
+      bgworker_pid=$(<"$bgworker_pid_file")
+      if [ -n "$bgworker_pid" ] && kill -0 "$bgworker_pid" 2>/dev/null; then
+        break
+      fi
+    fi
+    sleep 0.1
+  done
 
-  ${psrecord}/bin/psrecord $(cat build-17/bgworker.pid) --interval 1 --log "$record_log" > /dev/null
+  if [ -n "$bgworker_pid" ] && kill -0 "$bgworker_pid" 2>/dev/null; then
+    if ! ${psrecord}/bin/psrecord "$bgworker_pid" --interval 1 --log "$record_log" > /dev/null; then
+      echo "# psrecord failed while monitoring pid $bgworker_pid" > "$record_log"
+    fi
+  elif [ -f "$bgworker_pid_file" ]; then
+    if [ -n "$bgworker_pid" ]; then
+      echo "# background worker pid $bgworker_pid exited before psrecord started" > "$record_log"
+    else
+      echo "# background worker pid file present but empty at $bgworker_pid_file" > "$record_log"
+    fi
+  else
+    echo "# no background worker pid file at $bgworker_pid_file" > "$record_log"
+  fi
+
+  # Always wait for the load query process to finish before reading output.
+  wait "$load_pid"
 
   echo -e "## Loadtest results\n"
   cat $query_csv  | ${csvToMd}

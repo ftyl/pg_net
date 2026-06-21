@@ -37,7 +37,7 @@ static const int    net_worker_restart_time_sec  = 1;
 static const long   no_timeout                   = -1L;
 static bool         wake_commit_cb_active        = false;
 static bool         worker_should_restart        = false;
-static const size_t total_extension_tables       = 2;
+static const size_t total_extension_tables       = 3;
 
 static char *guc_ttl;
 static int   guc_batch_size;
@@ -212,15 +212,22 @@ static bool is_extension_locked(Oid ext_table_oids[static total_extension_tables
     return false;
   }
 
-  Oid queue_oid = get_relname_relid("http_request_queue", net_oid);
-  Oid resp_oid  = get_relname_relid("_http_response", net_oid);
+  Oid queue_oid    = get_relname_relid("http_request_queue", net_oid);
+  Oid resp_oid     = get_relname_relid("_http_response", net_oid);
+  Oid inflight_oid = get_relname_relid("http_request_inflight", net_oid);
+
+  if (!OidIsValid(queue_oid) || !OidIsValid(resp_oid) || !OidIsValid(inflight_oid)) {
+    return false;
+  }
 
   bool is_locked = ConditionalLockRelationOid(queue_oid, AccessShareLock) &&
-                   ConditionalLockRelationOid(resp_oid, AccessShareLock);
+                   ConditionalLockRelationOid(resp_oid, AccessShareLock) &&
+                   ConditionalLockRelationOid(inflight_oid, AccessShareLock);
 
   if (is_locked) {
     ext_table_oids[0] = queue_oid;
     ext_table_oids[1] = resp_oid;
+    ext_table_oids[2] = inflight_oid;
   }
 
   return is_locked;
@@ -229,6 +236,86 @@ static bool is_extension_locked(Oid ext_table_oids[static total_extension_tables
 static void unlock_extension(Oid ext_table_oids[static total_extension_tables]) {
   UnlockRelationOid(ext_table_oids[0], AccessShareLock);
   UnlockRelationOid(ext_table_oids[1], AccessShareLock);
+  UnlockRelationOid(ext_table_oids[2], AccessShareLock);
+}
+
+static bool begin_worker_tx(Oid ext_table_oids[static total_extension_tables]) {
+  SetCurrentStatementStartTimestamp();
+  StartTransactionCommand();
+  PushActiveSnapshot(GetTransactionSnapshot());
+
+  if (!is_extension_locked(ext_table_oids)) {
+    PopActiveSnapshot();
+    AbortCurrentTransaction();
+    return false;
+  }
+
+  SPI_connect();
+  return true;
+}
+
+static void commit_worker_tx(Oid ext_table_oids[static total_extension_tables]) {
+  SPI_finish();
+  unlock_extension(ext_table_oids);
+  PopActiveSnapshot();
+  CommitTransactionCommand();
+
+  // Flush worker table stats after every DB write transaction. Background
+  // workers don't have the regular query-loop flush path user backends have,
+  // and a burst can finish before the normal min-interval elapses.
+  pgstat_report_stat(true);
+}
+
+static uint64 fill_handle_slots(CurlHandle *handles, bool *slot_in_use, int *active_count,
+                                uint64 claimed_rows, int batch_size) {
+  MemoryContext old_ctx       = MemoryContextSwitchTo(TopMemoryContext);
+  uint64        slot_fill_idx = 0;
+  for (int i = 0; i < batch_size && slot_fill_idx < claimed_rows; i++) {
+    if (slot_in_use[i]) {
+      continue;
+    }
+
+    init_curl_handle(&handles[i], get_request_queue_row(SPI_tuptable->vals[slot_fill_idx],
+                                                        SPI_tuptable->tupdesc));
+    EREPORT_MULTI(curl_multi_add_handle(worker_state->curl_mhandle, handles[i].ez_handle));
+    slot_in_use[i] = true;
+    (*active_count)++;
+    slot_fill_idx++;
+  }
+
+  if (slot_fill_idx != claimed_rows) {
+    ereport(ERROR, errmsg("Failed to fill all claimed queue rows into worker slots"));
+  }
+
+  MemoryContextSwitchTo(old_ctx);
+  return slot_fill_idx;
+}
+
+static void cleanup_finished_handles(CurlHandle *handles, bool *slot_in_use, int *active_count,
+                                     CurlHandle **finished_handles, int num_finished,
+                                     int batch_size) {
+  for (int i = 0; i < num_finished; i++) {
+    bool        found_slot = false;
+    CurlHandle *handle     = finished_handles[i];
+
+    for (int j = 0; j < batch_size; j++) {
+      if (!slot_in_use[j] || &handles[j] != handle) {
+        continue;
+      }
+
+      curl_easy_cleanup(handles[j].ez_handle);
+      pfree_handle(&handles[j]);
+      memset(&handles[j], 0, sizeof(CurlHandle));
+      slot_in_use[j] = false;
+      (*active_count)--;
+      found_slot = true;
+      break;
+    }
+
+    if (!found_slot) {
+      ereport(ERROR, errmsg("Finished handle could not be matched to a worker slot"));
+    }
+  }
 }
 
 void pg_net_worker(__attribute__((unused)) Datum main_arg) {
@@ -265,6 +352,9 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
 
   publish_state(WS_RUNNING);
 
+  // Initial state: we go straight into the outer loop and wait for a wake.
+  pgstat_report_activity(STATE_IDLE, NULL);
+
   do {
 
     uint32 expected = 1;
@@ -274,119 +364,163 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
       continue;
     }
 
-    uint64 requests_consumed = 0;
-    uint64 expired_responses = 0;
+    pgstat_report_activity(STATE_RUNNING, NULL);
 
-    do {
-      SetCurrentStatementStartTimestamp();
-      StartTransactionCommand();
-      PushActiveSnapshot(GetTransactionSnapshot());
+    uint64 requests_claimed    = 0;
+    uint64 expired_responses   = 0;
+    uint64 reclaimed_requests  = 0;
+    int    active_count        = 0;
+    int    num_finished        = 0;
+    int    running_handles     = 0;
+    int    batch_size          = guc_batch_size;
+    bool   queue_may_have_more = true;
+    bool   extension_available = true;
 
-      Oid ext_table_oids[total_extension_tables];
+    CurlHandle  *handles          = palloc0(mul_size(sizeof(CurlHandle), batch_size));
+    bool        *slot_in_use      = palloc0(mul_size(sizeof(bool), batch_size));
+    CurlHandle **finished_handles = palloc0(mul_size(sizeof(CurlHandle *), batch_size));
+    CURLcode    *finished_results = palloc0(mul_size(sizeof(CURLcode), batch_size));
 
-      if (!is_extension_locked(ext_table_oids)) {
-        elog(DEBUG1, "pg_net extension not loaded");
-        PopActiveSnapshot();
-        AbortCurrentTransaction();
-        break;
-      }
+    while (!worker_should_restart) {
+      bool wake_pending = pg_atomic_read_u32(&worker_state->should_wake) == 1;
+      bool should_finalize_now =
+          num_finished > 0 && (active_count == num_finished || queue_may_have_more || wake_pending);
 
-      SPI_connect();
-
-      expired_responses = delete_expired_responses(guc_ttl, guc_batch_size);
-
-      elog(DEBUG1, "Deleted " UINT64_FORMAT " expired rows", expired_responses);
-
-      requests_consumed = consume_request_queue(guc_batch_size);
-
-      elog(DEBUG1, "Consumed " UINT64_FORMAT " request rows", requests_consumed);
-
-      if (requests_consumed > 0) {
-        CurlHandle *handles = palloc(mul_size(sizeof(CurlHandle), requests_consumed));
-
-        // initialize curl handles
-        for (size_t j = 0; j < requests_consumed; j++) {
-          init_curl_handle(&handles[j],
-                           get_request_queue_row(SPI_tuptable->vals[j], SPI_tuptable->tupdesc));
-
-          EREPORT_MULTI(curl_multi_add_handle(worker_state->curl_mhandle, handles[j].ez_handle));
+      if (active_count == 0 || should_finalize_now) {
+        Oid ext_table_oids[total_extension_tables];
+        if (!begin_worker_tx(ext_table_oids)) {
+          elog(DEBUG1, "pg_net extension not loaded");
+          extension_available = false;
+          break;
         }
 
-        // start curl event loop
-        int   running_handles = 0;
-        int   maxevents       = requests_consumed + 1; // 1 extra for the timer
-        event events[maxevents];
-
-        do {
-          int nfds =
-              wait_event(worker_state->epfd, events, maxevents, curl_handle_event_timeout_ms);
-
-          if (nfds < 0) {
-            int save_errno = errno;
-            if (save_errno == EINTR) { // can happen when the wait is interrupted, for example when
-                                       // running under GDB. Just continue in this case.
-              elog(DEBUG1, "wait_event() got %s, continuing", strerror(save_errno));
-              continue;
-            } else {
-              ereport(ERROR, errmsg("wait_event() failed: %s", strerror(save_errno)));
-              break;
-            }
+        if (num_finished > 0) {
+          for (int i = 0; i < num_finished; i++) {
+            insert_response(finished_handles[i], finished_results[i]);
+            mark_request_complete(finished_handles[i]->id);
           }
-
-          for (int i = 0; i < nfds; i++) {
-            if (is_timer(events[i])) {
-              EREPORT_MULTI(curl_multi_socket_action(worker_state->curl_mhandle,
-                                                     CURL_SOCKET_TIMEOUT, 0, &running_handles));
-            } else {
-              int curl_event = get_curl_event(events[i]);
-              int sockfd     = get_socket_fd(events[i]);
-
-              EREPORT_MULTI(curl_multi_socket_action(worker_state->curl_mhandle, sockfd, curl_event,
-                                                     &running_handles));
-            }
-          }
-
-          // insert finished responses
-          CURLMsg *msg       = NULL;
-          int      msgs_left = 0;
-          while ((msg = curl_multi_info_read(worker_state->curl_mhandle, &msgs_left))) {
-            if (msg->msg == CURLMSG_DONE) {
-              CurlHandle *handle = NULL;
-              EREPORT_CURL_GETINFO(msg->easy_handle, CURLINFO_PRIVATE, &handle);
-              insert_response(handle, msg->data.result);
-            } else {
-              ereport(ERROR, errmsg("curl_multi_info_read(), CURLMsg=%d\n", msg->msg));
-            }
-          }
-
-          elog(DEBUG1, "Pending curl running_handles: %d", running_handles);
-          // run while there are curl handles, some won't finish in a single iteration since they
-          // could be slow and waiting for a timeout
-        } while (running_handles > 0);
-
-        // cleanup
-        for (uint64 i = 0; i < requests_consumed; i++) {
-          EREPORT_MULTI(curl_multi_remove_handle(worker_state->curl_mhandle, handles[i].ez_handle));
-
-          curl_easy_cleanup(handles[i].ez_handle);
-
-          pfree_handle(&handles[i]);
+          cleanup_finished_handles(handles, slot_in_use, &active_count, finished_handles,
+                                   num_finished, batch_size);
+          num_finished = 0;
         }
 
-        pfree(handles);
+        int free_slots = batch_size - active_count;
+
+        expired_responses  = delete_expired_responses(guc_ttl, batch_size);
+        reclaimed_requests = reclaim_expired_inflight_requests(batch_size);
+
+        requests_claimed = 0;
+        if (!worker_should_restart && free_slots > 0) {
+          requests_claimed = claim_request_queue(free_slots);
+          if (requests_claimed > 0) {
+            fill_handle_slots(handles, slot_in_use, &active_count, requests_claimed, batch_size);
+          }
+          queue_may_have_more = requests_claimed == (uint64)free_slots;
+        }
+
+        commit_worker_tx(ext_table_oids);
+
+        elog(DEBUG1,
+             "Claimed " UINT64_FORMAT " rows, reclaimed " UINT64_FORMAT
+             " expired inflight rows, deleted " UINT64_FORMAT " expired responses",
+             requests_claimed, reclaimed_requests, expired_responses);
+
+        if (active_count == 0) {
+          if (expired_responses == 0 && requests_claimed == 0 && reclaimed_requests == 0) {
+            break;
+          }
+
+          wait_while_processing_interrupts(WORKER_WAIT_ONE_SECOND, &worker_should_restart);
+          continue;
+        }
       }
 
-      SPI_finish();
+      event events[batch_size + 1]; // 1 extra for timer fd
+      int   nfds =
+          wait_event(worker_state->epfd, events, batch_size + 1, curl_handle_event_timeout_ms);
 
-      unlock_extension(ext_table_oids);
+      if (nfds < 0) {
+        int save_errno = errno;
+        if (save_errno == EINTR) { // can happen when the wait is interrupted, for example when
+                                   // running under GDB. Just continue in this case.
+          elog(DEBUG1, "wait_event() got %s, continuing", strerror(save_errno));
+          continue;
+        } else {
+          ereport(ERROR, errmsg("wait_event() failed: %s", strerror(save_errno)));
+          break;
+        }
+      }
 
-      PopActiveSnapshot();
-      CommitTransactionCommand();
+      for (int i = 0; i < nfds; i++) {
+        if (is_timer(events[i])) {
+          EREPORT_MULTI(curl_multi_socket_action(worker_state->curl_mhandle, CURL_SOCKET_TIMEOUT, 0,
+                                                 &running_handles));
+        } else {
+          int curl_event = get_curl_event(events[i]);
+          int sockfd     = get_socket_fd(events[i]);
 
-      // slow down queue processing to avoid using too much CPU
-      wait_while_processing_interrupts(WORKER_WAIT_ONE_SECOND, &worker_should_restart);
+          EREPORT_MULTI(curl_multi_socket_action(worker_state->curl_mhandle, sockfd, curl_event,
+                                                 &running_handles));
+        }
+      }
 
-    } while (!worker_should_restart && (requests_consumed > 0 || expired_responses > 0));
+      CHECK_FOR_INTERRUPTS();
+      if (got_sighup) {
+        got_sighup = false;
+        ProcessConfigFile(PGC_SIGHUP);
+      }
+      if (pg_atomic_exchange_u32(&worker_state->got_restart, 0)) {
+        worker_should_restart = true;
+      }
+
+      CURLMsg *msg       = NULL;
+      int      msgs_left = 0;
+      while ((msg = curl_multi_info_read(worker_state->curl_mhandle, &msgs_left))) {
+        if (msg->msg == CURLMSG_DONE) {
+          CurlHandle *handle = NULL;
+          EREPORT_CURL_GETINFO(msg->easy_handle, CURLINFO_PRIVATE, &handle);
+          EREPORT_MULTI(curl_multi_remove_handle(worker_state->curl_mhandle, msg->easy_handle));
+          finished_handles[num_finished] = handle;
+          finished_results[num_finished] = msg->data.result;
+          num_finished++;
+        } else {
+          ereport(ERROR, errmsg("curl_multi_info_read(), CURLMsg=%d\n", msg->msg));
+        }
+      }
+    }
+
+    if (!extension_available) {
+      cleanup_finished_handles(handles, slot_in_use, &active_count, finished_handles, num_finished,
+                               batch_size);
+      num_finished = 0;
+    }
+
+    for (int i = 0; i < batch_size; i++) {
+      if (!slot_in_use[i]) {
+        continue;
+      }
+      EREPORT_MULTI(curl_multi_remove_handle(worker_state->curl_mhandle, handles[i].ez_handle));
+      curl_easy_cleanup(handles[i].ez_handle);
+      pfree_handle(&handles[i]);
+      slot_in_use[i] = false;
+    }
+
+    pfree(finished_results);
+    pfree(finished_handles);
+    pfree(slot_in_use);
+    pfree(handles);
+
+    // Background workers that modify tables must flush their pending
+    // pgstat counters themselves. Regular user backends do this
+    // automatically after each query via the main loop in tcop/postgres.c;
+    // background workers have no equivalent.
+    pgstat_report_stat(false);
+
+    // slow down queue processing to avoid using too much CPU
+    wait_while_processing_interrupts(WORKER_WAIT_ONE_SECOND, &worker_should_restart);
+
+    // Inner loop drained; back to waiting for the next wake.
+    pgstat_report_activity(STATE_IDLE, NULL);
 
   } while (!worker_should_restart);
 
