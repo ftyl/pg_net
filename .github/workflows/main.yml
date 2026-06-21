@@ -75,7 +75,8 @@ jobs:
 
       - name: Run load test
         run: |
-          nix-shell --run "net-loadtest ${{ matrix.params.reqs }} ${{ matrix.params.batch }}" >> "$GITHUB_STEP_SUMMARY"
+          set -o pipefail
+          nix-shell --run "net-loadtest ${{ matrix.params.reqs }} ${{ matrix.params.batch }}" | tee -a "$GITHUB_STEP_SUMMARY"
 
   coverage:
 
