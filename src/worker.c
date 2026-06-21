@@ -267,10 +267,10 @@ static void commit_worker_tx(Oid ext_table_oids[static total_extension_tables]) 
 }
 
 static uint64 fill_handle_slots(CurlHandle *handles, bool *slot_in_use, int *active_count,
-                                uint64 claimed_rows) {
+                                uint64 claimed_rows, int batch_size) {
   MemoryContext old_ctx       = MemoryContextSwitchTo(TopMemoryContext);
   uint64        slot_fill_idx = 0;
-  for (int i = 0; i < guc_batch_size && slot_fill_idx < claimed_rows; i++) {
+  for (int i = 0; i < batch_size && slot_fill_idx < claimed_rows; i++) {
     if (slot_in_use[i]) {
       continue;
     }
@@ -292,12 +292,13 @@ static uint64 fill_handle_slots(CurlHandle *handles, bool *slot_in_use, int *act
 }
 
 static void cleanup_finished_handles(CurlHandle *handles, bool *slot_in_use, int *active_count,
-                                     CurlHandle **finished_handles, int num_finished) {
+                                     CurlHandle **finished_handles, int num_finished,
+                                     int batch_size) {
   for (int i = 0; i < num_finished; i++) {
     bool        found_slot = false;
     CurlHandle *handle     = finished_handles[i];
 
-    for (int j = 0; j < guc_batch_size; j++) {
+    for (int j = 0; j < batch_size; j++) {
       if (!slot_in_use[j] || &handles[j] != handle) {
         continue;
       }
@@ -371,12 +372,13 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
     int    active_count        = 0;
     int    num_finished        = 0;
     int    running_handles     = 0;
+    int    batch_size          = guc_batch_size;
     bool   extension_available = true;
 
-    CurlHandle  *handles          = palloc0(mul_size(sizeof(CurlHandle), guc_batch_size));
-    bool        *slot_in_use      = palloc0(mul_size(sizeof(bool), guc_batch_size));
-    CurlHandle **finished_handles = palloc0(mul_size(sizeof(CurlHandle *), guc_batch_size));
-    CURLcode    *finished_results = palloc0(mul_size(sizeof(CURLcode), guc_batch_size));
+    CurlHandle  *handles          = palloc0(mul_size(sizeof(CurlHandle), batch_size));
+    bool        *slot_in_use      = palloc0(mul_size(sizeof(bool), batch_size));
+    CurlHandle **finished_handles = palloc0(mul_size(sizeof(CurlHandle *), batch_size));
+    CURLcode    *finished_results = palloc0(mul_size(sizeof(CURLcode), batch_size));
 
     while (!worker_should_restart) {
       if (active_count == 0 || num_finished > 0) {
@@ -393,20 +395,20 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
             mark_request_complete(finished_handles[i]->id);
           }
           cleanup_finished_handles(handles, slot_in_use, &active_count, finished_handles,
-                                   num_finished);
+                                   num_finished, batch_size);
           num_finished = 0;
         }
 
-        int free_slots = guc_batch_size - active_count;
+        int free_slots = batch_size - active_count;
 
-        expired_responses  = delete_expired_responses(guc_ttl, guc_batch_size);
-        reclaimed_requests = reclaim_expired_inflight_requests(guc_batch_size);
+        expired_responses  = delete_expired_responses(guc_ttl, batch_size);
+        reclaimed_requests = reclaim_expired_inflight_requests(batch_size);
 
         requests_claimed = 0;
         if (!worker_should_restart && free_slots > 0) {
           requests_claimed = claim_request_queue(free_slots);
           if (requests_claimed > 0) {
-            fill_handle_slots(handles, slot_in_use, &active_count, requests_claimed);
+            fill_handle_slots(handles, slot_in_use, &active_count, requests_claimed, batch_size);
           }
         }
 
@@ -427,9 +429,9 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
         }
       }
 
-      event events[guc_batch_size + 1]; // 1 extra for timer fd
+      event events[batch_size + 1]; // 1 extra for timer fd
       int   nfds =
-          wait_event(worker_state->epfd, events, guc_batch_size + 1, curl_handle_event_timeout_ms);
+          wait_event(worker_state->epfd, events, batch_size + 1, curl_handle_event_timeout_ms);
 
       if (nfds < 0) {
         int save_errno = errno;
@@ -483,11 +485,12 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
     }
 
     if (!extension_available) {
-      cleanup_finished_handles(handles, slot_in_use, &active_count, finished_handles, num_finished);
+      cleanup_finished_handles(handles, slot_in_use, &active_count, finished_handles, num_finished,
+                               batch_size);
       num_finished = 0;
     }
 
-    for (int i = 0; i < guc_batch_size; i++) {
+    for (int i = 0; i < batch_size; i++) {
       if (!slot_in_use[i]) {
         continue;
       }
