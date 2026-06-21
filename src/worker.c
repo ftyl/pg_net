@@ -261,8 +261,9 @@ static void commit_worker_tx(Oid ext_table_oids[static total_extension_tables]) 
   CommitTransactionCommand();
 
   // Flush worker table stats after every DB write transaction. Background
-  // workers don't have the regular query-loop flush path user backends have.
-  pgstat_report_stat(false);
+  // workers don't have the regular query-loop flush path user backends have,
+  // and a burst can finish before the normal min-interval elapses.
+  pgstat_report_stat(true);
 }
 
 static uint64 fill_handle_slots(CurlHandle *handles, bool *slot_in_use, int *active_count,
