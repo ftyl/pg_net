@@ -18,6 +18,22 @@ create unlogged table net.http_request_queue(
     timeout_milliseconds int not null
 );
 
+-- Store requests that are actively being processed by the worker.
+-- Rows remain here until a response is persisted, which prevents losing work
+-- when the worker restarts mid-request.
+-- API: Private
+create unlogged table net.http_request_inflight(
+    id bigint primary key,
+    method net.http_method not null,
+    url text not null,
+    headers jsonb,
+    body bytea,
+    timeout_milliseconds int not null,
+    lease_expires_at timestamptz not null
+);
+
+create index on net.http_request_inflight (lease_expires_at);
+
 create or replace function net.check_worker_is_up() returns void as $$
 begin
   if not exists (select pid from pg_stat_activity where backend_type ilike '%pg_net%') then

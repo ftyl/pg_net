@@ -43,13 +43,17 @@ typedef struct {
 
 uint64 delete_expired_responses(char *ttl, int batch_size);
 
-uint64 consume_request_queue(const int batch_size);
+uint64 reclaim_expired_inflight_requests(const int batch_size);
+
+uint64 claim_request_queue(const int batch_size);
 
 RequestQueueRow get_request_queue_row(HeapTuple spi_tupval, TupleDesc spi_tupdesc);
 
 void set_curl_mhandle(WorkerState *wstate);
 
 void insert_response(CurlHandle *handle, CURLcode curl_return_code);
+
+void mark_request_complete(int64 request_id);
 
 void init_curl_handle(CurlHandle *handle, RequestQueueRow row);
 

@@ -12,8 +12,10 @@
 #include "event.h"
 
 static SPIPlanPtr del_response_plan     = NULL;
-static SPIPlanPtr del_return_queue_plan = NULL;
+static SPIPlanPtr reclaim_inflight_plan = NULL;
+static SPIPlanPtr claim_queue_plan      = NULL;
 static SPIPlanPtr ins_response_plan     = NULL;
+static SPIPlanPtr del_inflight_plan     = NULL;
 
 static size_t body_cb(void *contents, size_t size, size_t nmemb, void *userp) {
   CurlHandle *handle   = (CurlHandle *)userp;
@@ -157,34 +159,101 @@ uint64 delete_expired_responses(char *ttl, int batch_size) {
   return affected_rows;
 }
 
-uint64 consume_request_queue(const int batch_size) {
-  if (del_return_queue_plan == NULL) {
+uint64 reclaim_expired_inflight_requests(const int batch_size) {
+  if (reclaim_inflight_plan == NULL) {
     SPIPlanPtr tmp = SPI_prepare("\
         WITH\
         rows AS (\
-          SELECT id\
-          FROM net.http_request_queue\
-          ORDER BY id\
+          SELECT ctid\
+          FROM net.http_request_inflight\
+          WHERE lease_expires_at <= now()\
+          ORDER BY lease_expires_at\
           LIMIT $1\
+        ),\
+        expired AS (\
+          DELETE FROM net.http_request_inflight i\
+          USING rows\
+          WHERE i.ctid = rows.ctid\
+          RETURNING i.id, i.method, i.url, i.headers, i.body, i.timeout_milliseconds\
         )\
-        DELETE FROM net.http_request_queue q\
-        USING rows WHERE q.id = rows.id\
-        RETURNING q.id, q.method, q.url, timeout_milliseconds, array(select key || ': ' || value from jsonb_each_text(q.headers)), q.body",
+        INSERT INTO net.http_request_queue (id, method, url, headers, body, timeout_milliseconds)\
+        SELECT id, method, url, headers, body, timeout_milliseconds\
+        FROM expired",
                                  1, (Oid[]){INT4OID});
 
     if (tmp == NULL)
       ereport(ERROR, errmsg("SPI_prepare failed: %s", SPI_result_code_string(SPI_result)));
 
-    del_return_queue_plan = SPI_saveplan(tmp);
-    if (del_return_queue_plan == NULL) ereport(ERROR, errmsg("SPI_saveplan failed"));
+    reclaim_inflight_plan = SPI_saveplan(tmp);
+    if (reclaim_inflight_plan == NULL) ereport(ERROR, errmsg("SPI_saveplan failed"));
+  }
+
+  int ret_code = SPI_execute_plan(reclaim_inflight_plan, (Datum[]){Int32GetDatum(batch_size)}, NULL,
+                                  false, 0);
+
+  if (ret_code != SPI_OK_INSERT) {
+    ereport(ERROR,
+            errmsg("Error reclaiming inflight requests: %s", SPI_result_code_string(ret_code)));
+  }
+
+  return SPI_processed;
+}
+
+uint64 claim_request_queue(const int batch_size) {
+  if (claim_queue_plan == NULL) {
+    SPIPlanPtr tmp = SPI_prepare("\
+        WITH\
+        rows AS (\
+          SELECT ctid, id, method, url, timeout_milliseconds, headers, body\
+          FROM net.http_request_queue\
+          ORDER BY id\
+          LIMIT $1\
+        ),\
+        claimed AS (\
+          DELETE FROM net.http_request_queue q\
+          USING rows\
+          WHERE q.ctid = rows.ctid\
+          RETURNING rows.id, rows.method, rows.url, rows.timeout_milliseconds, rows.headers, rows.body\
+        ),\
+        inserted AS (\
+          INSERT INTO net.http_request_inflight(\
+            id, method, url, headers, body, timeout_milliseconds, lease_expires_at\
+          )\
+          SELECT\
+            id,\
+            method,\
+            url,\
+            headers,\
+            body,\
+            timeout_milliseconds,\
+            now() + (timeout_milliseconds::text || ' milliseconds')::interval + interval '30 seconds'\
+          FROM claimed\
+          RETURNING\
+            id,\
+            method,\
+            url,\
+            timeout_milliseconds,\
+            array(select key || ': ' || value from jsonb_each_text(headers)),\
+            body\
+        )\
+        SELECT *\
+        FROM inserted\
+        ORDER BY id",
+                                 1, (Oid[]){INT4OID});
+
+    if (tmp == NULL)
+      ereport(ERROR, errmsg("SPI_prepare failed: %s", SPI_result_code_string(SPI_result)));
+
+    claim_queue_plan = SPI_saveplan(tmp);
+    if (claim_queue_plan == NULL) ereport(ERROR, errmsg("SPI_saveplan failed"));
   }
 
   int ret_code =
-      SPI_execute_plan(del_return_queue_plan, (Datum[]){Int32GetDatum(batch_size)}, NULL, false, 0);
+      SPI_execute_plan(claim_queue_plan, (Datum[]){Int32GetDatum(batch_size)}, NULL, false, 0);
 
-  if (ret_code != SPI_OK_DELETE_RETURNING)
-    ereport(ERROR,
-            errmsg("Error getting http request queue: %s", SPI_result_code_string(ret_code)));
+  if (ret_code != SPI_OK_SELECT)
+    ereport(ERROR, errmsg("Error claiming http request queue rows: %s",
+                          SPI_result_code_string(ret_code)));
 
   return SPI_processed;
 }
@@ -313,6 +382,25 @@ void insert_response(CurlHandle *handle, CURLcode curl_return_code) {
 
   if (ret_code != SPI_OK_INSERT) {
     ereport(ERROR, errmsg("Error when inserting response: %s", SPI_result_code_string(ret_code)));
+  }
+}
+
+void mark_request_complete(int64 request_id) {
+  if (del_inflight_plan == NULL) {
+    SPIPlanPtr tmp =
+        SPI_prepare("DELETE FROM net.http_request_inflight WHERE id = $1", 1, (Oid[]){INT8OID});
+    if (tmp == NULL)
+      ereport(ERROR, errmsg("SPI_prepare failed: %s", SPI_result_code_string(SPI_result)));
+
+    del_inflight_plan = SPI_saveplan(tmp);
+    if (del_inflight_plan == NULL) ereport(ERROR, errmsg("SPI_saveplan failed"));
+  }
+
+  int ret_code = SPI_execute_plan(del_inflight_plan, (Datum[]){Int64GetDatum(request_id)}, NULL,
+                                  false, 0);
+  if (ret_code != SPI_OK_DELETE) {
+    ereport(ERROR, errmsg("Error when completing inflight request: %s",
+                          SPI_result_code_string(ret_code)));
   }
 }
 
