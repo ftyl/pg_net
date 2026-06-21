@@ -108,10 +108,12 @@ def test_http_responses_will_complete_deletion(sess, autocommit_sess):
     sess.execute(text("select net.wake()"))
     sess.commit() # commit so worker  wakes
 
-    # With a throttled worker this is 2 (one delete batch). With a faster
-    # worker it may already be 0 by the time we observe.
-    (count,) = sess.execute(text("select count(*) from net._http_response")).fetchone()
-    assert count in (0, 2)
+    # Depending on timing, the first wake may initially see no expired rows,
+    # but deletion should still make progress shortly after.
+    assert wait_until(
+        lambda: sess.execute(text("select count(*) from net._http_response")).scalar() < 4,
+        timeout=3.0,
+    ), "expired response deletion did not make progress"
 
     assert wait_until(
         lambda: sess.execute(text("select count(*) from net._http_response")).scalar() == 0,

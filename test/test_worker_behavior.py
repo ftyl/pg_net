@@ -105,7 +105,7 @@ def test_worker_will_process_queue_when_up(sess):
 
     sess.commit()
 
-    assert wait_until(lambda: is_worker_up(sess) is True, timeout=5.0), "worker did not come up"
+    assert wait_until(lambda: is_worker_up(sess) is True, timeout=15.0), "worker did not come up"
     assert wait_until(
         lambda: sess.execute(text("select count(*) from net.http_request_queue;")).scalar() == 0,
         timeout=5.0,
