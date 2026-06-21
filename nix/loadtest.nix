@@ -16,7 +16,12 @@ let
         raw_lines = sys.stdin.read().splitlines()
 
         header_line = next(
-            (line for line in raw_lines if line.lstrip().startswith("# Elapsed time")), None
+            (
+                line
+                for line in raw_lines
+                if line.lstrip().startswith("# Elapsed time")
+            ),
+            None,
         )
         if header_line is None:
             # Fallback note (e.g. worker exited before monitor attach). Render
