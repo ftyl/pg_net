@@ -17,10 +17,13 @@ def wait_until(predicate, timeout=5.0, interval=0.1):
 
 
 def is_worker_up(sess):
-    (up,) = sess.execute(text("""
-        with _ as (select pg_stat_clear_snapshot())
-        select exists(select pid from pg_stat_activity where backend_type ilike '%pg_net%');
-    """)).fetchone()
+    # pg_stat_activity values can be cached per backend; clear the snapshot in
+    # a separate statement before querying, otherwise we can repeatedly read a
+    # stale "worker is down" state after restart.
+    sess.execute(text("select pg_stat_clear_snapshot();"))
+    (up,) = sess.execute(text(
+        "select exists(select pid from pg_stat_activity where backend_type ilike '%pg_net%');"
+    )).fetchone()
     return up
 
 
