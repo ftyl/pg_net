@@ -16,9 +16,16 @@ let
         raw_lines = sys.stdin.read().splitlines()
 
         header_line = next(
-            (line for line in raw_lines if line.lstrip().startswith("#")), None
+            (line for line in raw_lines if line.lstrip().startswith("# Elapsed time")), None
         )
         if header_line is None:
+            # Fallback note (e.g. worker exited before monitor attach). Render
+            # plainly instead of failing or producing an empty table.
+            if raw_lines:
+                print("```")
+                print("\n".join(raw_lines))
+                print("```")
+                sys.exit(0)
             sys.exit("Error: no header line found in input.")
 
         columns = HEADER_SPLIT.split(header_line.lstrip("#").strip())
@@ -83,16 +90,17 @@ writeShellScriptBin "net-loadtest" ''
 
   bgworker_pid_file=build-17/bgworker.pid
   bgworker_pid=""
-  # The worker can start and finish quickly with fast refill logic. Poll briefly
-  # for a live pid instead of relying on a fixed sleep.
-  for _ in $(seq 1 50); do
+  # The worker can start later than harness boot, so keep polling for a live
+  # worker pid while the load query process is still running.
+  while kill -0 "$load_pid" 2>/dev/null; do
     if [ -f "$bgworker_pid_file" ]; then
-      bgworker_pid=$(<"$bgworker_pid_file")
-      if [ -n "$bgworker_pid" ] && kill -0 "$bgworker_pid" 2>/dev/null; then
+      candidate_pid=$(<"$bgworker_pid_file")
+      if [ -n "$candidate_pid" ] && kill -0 "$candidate_pid" 2>/dev/null; then
+        bgworker_pid="$candidate_pid"
         break
       fi
     fi
-    sleep 0.1
+    sleep 0.2
   done
 
   if [ -n "$bgworker_pid" ] && kill -0 "$bgworker_pid" 2>/dev/null; then
@@ -106,7 +114,7 @@ writeShellScriptBin "net-loadtest" ''
       echo "# background worker pid file present but empty at $bgworker_pid_file" > "$record_log"
     fi
   else
-    echo "# no background worker pid file at $bgworker_pid_file" > "$record_log"
+    echo "# no background worker pid file at $bgworker_pid_file while load process ran" > "$record_log"
   fi
 
   # Always wait for the load query process to finish before reading output.
