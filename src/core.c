@@ -166,7 +166,7 @@ uint64 reclaim_expired_inflight_requests(const int batch_size) {
         rows AS (\
           SELECT ctid\
           FROM net.http_request_inflight\
-          WHERE lease_expires_at <= now()\
+          WHERE lease_expires_at <= now() OR worker_pid <> pg_backend_pid()\
           ORDER BY lease_expires_at\
           LIMIT $1\
         ),\
@@ -217,7 +217,7 @@ uint64 claim_request_queue(const int batch_size) {
         ),\
         inserted AS (\
           INSERT INTO net.http_request_inflight(\
-            id, method, url, headers, body, timeout_milliseconds, lease_expires_at\
+            id, method, url, headers, body, timeout_milliseconds, worker_pid, lease_expires_at\
           )\
           SELECT\
             id,\
@@ -226,6 +226,7 @@ uint64 claim_request_queue(const int batch_size) {
             headers,\
             body,\
             timeout_milliseconds,\
+            pg_backend_pid(),\
             now() + (timeout_milliseconds::text || ' milliseconds')::interval + interval '30 seconds'\
           FROM claimed\
           RETURNING\

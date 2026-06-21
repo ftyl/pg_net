@@ -412,12 +412,12 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
              " expired inflight rows, deleted " UINT64_FORMAT " expired responses",
              requests_claimed, reclaimed_requests, expired_responses);
 
-        if (active_count == 0 && requests_claimed == 0 && reclaimed_requests == 0 &&
-            expired_responses == 0) {
-          break;
-        }
-
         if (active_count == 0) {
+          if (expired_responses == 0 && requests_claimed == 0 && reclaimed_requests == 0) {
+            break;
+          }
+
+          wait_while_processing_interrupts(WORKER_WAIT_ONE_SECOND, &worker_should_restart);
           continue;
         }
       }

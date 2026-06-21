@@ -29,6 +29,7 @@ create unlogged table net.http_request_inflight(
     headers jsonb,
     body bytea,
     timeout_milliseconds int not null,
+    worker_pid integer not null,
     lease_expires_at timestamptz not null
 );
 

@@ -5,8 +5,19 @@ create unlogged table if not exists net.http_request_inflight(
     headers jsonb,
     body bytea,
     timeout_milliseconds int not null,
+    worker_pid integer not null,
     lease_expires_at timestamptz not null
 );
+
+alter table net.http_request_inflight
+    add column if not exists worker_pid integer;
+
+update net.http_request_inflight
+set worker_pid = coalesce(worker_pid, 0)
+where worker_pid is null;
+
+alter table net.http_request_inflight
+    alter column worker_pid set not null;
 
 create index if not exists http_request_inflight_lease_expires_at_idx
     on net.http_request_inflight (lease_expires_at);
