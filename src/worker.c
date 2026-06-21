@@ -259,6 +259,10 @@ static void commit_worker_tx(Oid ext_table_oids[static total_extension_tables]) 
   unlock_extension(ext_table_oids);
   PopActiveSnapshot();
   CommitTransactionCommand();
+
+  // Flush worker table stats after every DB write transaction. Background
+  // workers don't have the regular query-loop flush path user backends have.
+  pgstat_report_stat(false);
 }
 
 static uint64 fill_handle_slots(CurlHandle *handles, bool *slot_in_use, int *active_count,
@@ -374,7 +378,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
     CURLcode    *finished_results = palloc0(mul_size(sizeof(CURLcode), guc_batch_size));
 
     while (!worker_should_restart) {
-      if (active_count < guc_batch_size || num_finished > 0) {
+      if (active_count == 0 || num_finished > 0) {
         Oid ext_table_oids[total_extension_tables];
         if (!begin_worker_tx(ext_table_oids)) {
           elog(DEBUG1, "pg_net extension not loaded");
