@@ -415,7 +415,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
           if (requests_claimed > 0) {
             fill_handle_slots(handles, slot_in_use, &active_count, requests_claimed, batch_size);
           }
-          queue_may_have_more = requests_claimed == free_slots;
+          queue_may_have_more = requests_claimed == (uint64)free_slots;
         }
 
         commit_worker_tx(ext_table_oids);
