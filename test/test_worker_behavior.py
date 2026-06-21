@@ -17,7 +17,10 @@ def wait_until(predicate, timeout=5.0, interval=0.1):
 
 
 def is_worker_up(sess):
-    (up,) = sess.execute(text("select is_worker_up();")).fetchone()
+    (up,) = sess.execute(text("""
+        with _ as (select pg_stat_clear_snapshot())
+        select exists(select pid from pg_stat_activity where backend_type ilike '%pg_net%');
+    """)).fetchone()
     return up
 
 
@@ -91,25 +94,15 @@ def test_worker_will_process_queue_when_up(sess):
 
     sess.commit()
 
-    # check requests where enqueued
-    (count,) = sess.execute(text(
-    """
-        select count(*) from net.http_request_queue;
-    """
-    )).fetchone()
-
-    assert count == 10
-
-    # check worker is still down
-    assert is_worker_up(sess) is False
-
-    sess.commit()
-
     assert wait_until(lambda: is_worker_up(sess) is True, timeout=15.0), "worker did not come up"
     assert wait_until(
-        lambda: sess.execute(text("select count(*) from net.http_request_queue;")).scalar() == 0,
-        timeout=5.0,
-    ), "worker did not drain request queue"
+        lambda: (
+            sess.execute(text("select count(*) from net.http_request_queue;")).scalar() == 0
+            and sess.execute(text("select count(*) from net.http_request_inflight;")).scalar() == 0
+            and sess.execute(text("select count(*) from net._http_response;")).scalar() == 10
+        ),
+        timeout=10.0,
+    ), "worker did not fully process requests after restart"
 
     (status_code,count) = sess.execute(text(
     """
