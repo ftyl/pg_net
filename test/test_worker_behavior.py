@@ -7,6 +7,20 @@ import time
 import subprocess
 import os
 
+def wait_until(predicate, timeout=5.0, interval=0.1):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def is_worker_up(sess):
+    (up,) = sess.execute(text("select is_worker_up();")).fetchone()
+    return up
+
+
 def test_worker_will_not_block_drop_database(autocommit_sess):
     """the worker will not block a session doing drop database"""
 
@@ -55,11 +69,7 @@ def test_worker_will_process_queue_when_up(sess):
     """when pg background worker is down and requests arrive, it will process them once it wakes up"""
 
     # check worker up
-    (up,) = sess.execute(text("""
-        select is_worker_up();
-    """)).fetchone()
-    assert up is not None
-    assert up == True
+    assert is_worker_up(sess) is True
 
     # restart it
     (restarted,) = sess.execute(text("""
@@ -71,11 +81,7 @@ def test_worker_will_process_queue_when_up(sess):
     time.sleep(0.1)
 
     # check worker down
-    (up,) = sess.execute(text("""
-        select is_worker_up();
-    """)).fetchone()
-    assert up is not None
-    assert up == False
+    assert is_worker_up(sess) is False
 
     sess.execute(text(
         """
@@ -95,34 +101,15 @@ def test_worker_will_process_queue_when_up(sess):
     assert count == 10
 
     # check worker is still down
-    (up,) = sess.execute(text("""
-        select is_worker_up();
-    """)).fetchone()
-    assert up is not None
-    assert up == False
+    assert is_worker_up(sess) is False
 
     sess.commit()
 
-    # wait until up
-    time.sleep(2.1)
-
-    # check worker up
-    (up,) = sess.execute(text("""
-        select is_worker_up();
-    """)).fetchone()
-    assert up is not None
-    assert up == True
-
-    # wait until new requests are done
-    time.sleep(1.1)
-
-    (count,) = sess.execute(text(
-    """
-        select count(*) from net.http_request_queue;
-    """
-    )).fetchone()
-
-    assert count == 0
+    assert wait_until(lambda: is_worker_up(sess) is True, timeout=5.0), "worker did not come up"
+    assert wait_until(
+        lambda: sess.execute(text("select count(*) from net.http_request_queue;")).scalar() == 0,
+        timeout=5.0,
+    ), "worker did not drain request queue"
 
     (status_code,count) = sess.execute(text(
     """
@@ -213,8 +200,10 @@ def test_no_failure_on_drop_extension(sess):
 
     sess.commit()
 
-    # wait until processing
-    time.sleep(1)
+    assert wait_until(
+        lambda: sess.execute(text("select count(*) from net.http_request_inflight;")).scalar() > 0,
+        timeout=3.0,
+    ), "worker never picked the slow request into inflight"
 
     sess.execute(text("""
         drop extension pg_net cascade;
@@ -222,14 +211,7 @@ def test_no_failure_on_drop_extension(sess):
 
     sess.commit()
 
-    # wait until request is finished
-    time.sleep(3)
-
-    (up,) = sess.execute(text("""
-        select is_worker_up();
-    """)).fetchone()
-    assert up is not None
-    assert up == True
+    assert wait_until(lambda: is_worker_up(sess) is True, timeout=5.0), "worker did not recover"
 
 
 def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess):
@@ -277,7 +259,10 @@ def test_worker_will_keep_processing_queue_when_restarted(sess, autocommit_sess)
     assert count < 5
 
     # give enough time for all 5 slow requests to finish (5 * 0.5s = 2.5s + overhead)
-    time.sleep(6)
+    assert wait_until(
+        lambda: sess.execute(text("select count(*) from net._http_response;")).scalar() == 5,
+        timeout=10.0,
+    ), "worker did not finish all restarted requests"
 
     (status_code,count) = sess.execute(text(
     """
@@ -304,8 +289,11 @@ def test_new_requests_get_attended_asap(sess):
 
     sess.commit()
 
-    # less than a second
-    time.sleep(0.1)
+    assert wait_until(
+        lambda: sess.execute(text("select count(*) from net._http_response;")).scalar() == 10,
+        timeout=1.0,
+        interval=0.05,
+    ), "responses were not completed within 1s"
 
     (status_code,count) = sess.execute(text(
     """
@@ -365,8 +353,10 @@ def test_direct_inserts_no_requests(sess):
 
     sess.commit()
 
-    # wait for req
-    time.sleep(0.1)
+    assert wait_until(
+        lambda: sess.execute(text("select count(*) from net._http_response;")).scalar() == 1,
+        timeout=3.0,
+    ), "explicit wake did not trigger processing"
 
     (status_code, count) = sess.execute(text(
     """
@@ -409,15 +399,15 @@ def test_processing_survives_postmaster_crash():
     pgdata_env = os.getenv('PGDATA')
     subprocess.run(["pg_ctl", "restart", "-D", pgdata_env])
 
-    # give it some time to finish restart
-    time.sleep(1)
-
     engine = create_engine("postgresql:///postgres")
     ac_engine = engine.execution_options(isolation_level="AUTOCOMMIT")
     tmp_sess = Session(ac_engine)
 
-    # give it enough time to finish processing the queue
-    time.sleep(1)
+    assert wait_until(lambda: is_worker_up(tmp_sess) is True, timeout=10.0), "worker did not come up after restart"
+    assert wait_until(
+        lambda: tmp_sess.execute(text("select count(*) from net.http_request_queue;")).scalar() == 0,
+        timeout=10.0,
+    ), "queue did not drain after postmaster restart"
 
     (count,) = tmp_sess.execute(text(
     """
