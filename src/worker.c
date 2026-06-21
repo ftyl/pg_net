@@ -373,6 +373,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
     int    num_finished        = 0;
     int    running_handles     = 0;
     int    batch_size          = guc_batch_size;
+    bool   queue_may_have_more = true;
     bool   extension_available = true;
 
     CurlHandle  *handles          = palloc0(mul_size(sizeof(CurlHandle), batch_size));
@@ -381,7 +382,11 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
     CURLcode    *finished_results = palloc0(mul_size(sizeof(CURLcode), batch_size));
 
     while (!worker_should_restart) {
-      if (active_count == 0 || num_finished > 0) {
+      bool wake_pending = pg_atomic_read_u32(&worker_state->should_wake) == 1;
+      bool should_finalize_now =
+          num_finished > 0 && (active_count == num_finished || queue_may_have_more || wake_pending);
+
+      if (active_count == 0 || should_finalize_now) {
         Oid ext_table_oids[total_extension_tables];
         if (!begin_worker_tx(ext_table_oids)) {
           elog(DEBUG1, "pg_net extension not loaded");
@@ -410,6 +415,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
           if (requests_claimed > 0) {
             fill_handle_slots(handles, slot_in_use, &active_count, requests_claimed, batch_size);
           }
+          queue_may_have_more = requests_claimed == free_slots;
         }
 
         commit_worker_tx(ext_table_oids);
@@ -469,7 +475,6 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
 
       CURLMsg *msg       = NULL;
       int      msgs_left = 0;
-      num_finished       = 0;
       while ((msg = curl_multi_info_read(worker_state->curl_mhandle, &msgs_left))) {
         if (msg->msg == CURLMSG_DONE) {
           CurlHandle *handle = NULL;
