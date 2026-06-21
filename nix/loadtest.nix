@@ -83,7 +83,19 @@ writeShellScriptBin "net-loadtest" ''
   # wait for process to start so we can capture it with psrecord
   sleep 2
 
-  ${psrecord}/bin/psrecord $(cat build-17/bgworker.pid) --interval 1 --log "$record_log" > /dev/null
+  bgworker_pid_file=build-17/bgworker.pid
+  if [ -f "$bgworker_pid_file" ]; then
+    bgworker_pid=$(cat "$bgworker_pid_file")
+    if kill -0 "$bgworker_pid" 2>/dev/null; then
+      if ! ${psrecord}/bin/psrecord "$bgworker_pid" --interval 1 --log "$record_log" > /dev/null; then
+        echo "# psrecord failed while monitoring pid $bgworker_pid" > "$record_log"
+      fi
+    else
+      echo "# background worker pid $bgworker_pid exited before psrecord started" > "$record_log"
+    fi
+  else
+    echo "# no background worker pid file at $bgworker_pid_file" > "$record_log"
+  fi
 
   echo -e "## Loadtest results\n"
   cat $query_csv  | ${csvToMd}
